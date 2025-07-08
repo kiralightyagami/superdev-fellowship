@@ -45,7 +45,7 @@ pub struct AccountMetaResponse {
 #[derive(Serialize)]
 pub struct CreateTokenResponse {
     pub program_id: String,
-    pub accounts: AccountMetaResponse,
+    pub accounts: Vec<AccountMetaResponse>,
     pub instruction_data: String,
 }
 
@@ -59,7 +59,7 @@ pub struct InstructionResponse {
 #[derive(Serialize)]
 pub struct SignMessageResponse {
     pub signature: String,
-    pub public_key: String,
+    pub pubkey: String,
     pub message: String,
 }
 

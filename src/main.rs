@@ -35,7 +35,7 @@ async fn create_token(Json(payload): Json<CreateTokenRequest>) -> poem::Result<p
                 .body(serde_json::to_string(&response).unwrap()))
         },
         Err(e) => {
-            let response = ApiResponse::<InstructionResponse>::error(e.to_string());
+            let response = ApiResponse::<CreateTokenResponse>::error(e.to_string());
             Ok(poem::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .content_type("application/json")
@@ -44,16 +44,20 @@ async fn create_token(Json(payload): Json<CreateTokenRequest>) -> poem::Result<p
     }
 }
 
-fn create_token_instruction(payload: &CreateTokenRequest) -> anyhow::Result<InstructionResponse> {
-    let mint_pubkey = Pubkey::from_str(&payload.mint)?;
-    let mint_authority_pubkey = Pubkey::from_str(&payload.mint_authority)?;
+fn create_token_instruction(payload: &CreateTokenRequest) -> anyhow::Result<CreateTokenResponse> {
+    let mint = payload.mint.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: mint"))?;
+    let mint_authority = payload.mint_authority.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: mintAuthority"))?;
+    let decimals = payload.decimals.ok_or_else(|| anyhow::anyhow!("Missing required field: decimals"))?;
+
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    let mint_authority_pubkey = Pubkey::from_str(mint_authority)?;
 
     let instruction = token_instruction::initialize_mint(
         &spl_token::id(),
         &mint_pubkey,
         &mint_authority_pubkey,
         None,
-        payload.decimals,
+        decimals,
     )?;
 
     let accounts: Vec<AccountMetaResponse> = instruction
@@ -66,7 +70,7 @@ fn create_token_instruction(payload: &CreateTokenRequest) -> anyhow::Result<Inst
         })
         .collect();
 
-    Ok(InstructionResponse {
+    Ok(CreateTokenResponse {
         program_id: instruction.program_id.to_string(),
         accounts,
         instruction_data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &instruction.data),
@@ -94,17 +98,28 @@ async fn mint_token(Json(payload): Json<MintTokenRequest>) -> poem::Result<poem:
 }
 
 fn mint_token_instruction(payload: &MintTokenRequest) -> anyhow::Result<InstructionResponse> {
-    let mint_pubkey = Pubkey::from_str(&payload.mint)?;
-    let destination_pubkey = Pubkey::from_str(&payload.destination)?;
-    let authority_pubkey = Pubkey::from_str(&payload.authority)?;
+    let mint = payload.mint.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: mint"))?;
+    let destination = payload.destination.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: destination"))?;
+    let authority = payload.authority.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: authority"))?;
+    let amount = payload.amount.ok_or_else(|| anyhow::anyhow!("Missing required field: amount"))?;
+
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    let destination_pubkey = Pubkey::from_str(destination)?;
+    let authority_pubkey = Pubkey::from_str(authority)?;
+
+    
+    let destination_ata = spl_associated_token_account::get_associated_token_address(
+        &destination_pubkey,
+        &mint_pubkey,
+    );
 
     let instruction = token_instruction::mint_to(
         &spl_token::id(),
         &mint_pubkey,
-        &destination_pubkey,
+        &destination_ata,
         &authority_pubkey,
         &[],
-        payload.amount,
+        amount,
     )?;
 
     let accounts: Vec<AccountMetaResponse> = instruction
@@ -156,8 +171,8 @@ fn sign_message_handler(payload: &SignMessageRequest) -> anyhow::Result<SignMess
     let signature = keypair.sign_message(message_bytes);
     
     Ok(SignMessageResponse {
-        signature: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref()),
-        public_key: bs58::encode(keypair.pubkey().to_bytes()).into_string(),
+        signature: bs58::encode(signature.as_ref()).into_string(),
+        pubkey: bs58::encode(keypair.pubkey().to_bytes()).into_string(),
         message: payload.message.clone(),
     })
 }
@@ -184,7 +199,7 @@ async fn verify_message(Json(payload): Json<VerifyMessageRequest>) -> poem::Resu
 
 fn verify_message_handler(payload: &VerifyMessageRequest) -> anyhow::Result<VerifyMessageResponse> {
     let pubkey_bytes = bs58::decode(&payload.pubkey).into_vec()?;
-    let signature_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.signature)?;
+    let signature_bytes = bs58::decode(&payload.signature).into_vec()?;
     let message_bytes = payload.message.as_bytes();
 
     if pubkey_bytes.len() != 32 {
@@ -233,18 +248,20 @@ async fn send_sol(Json(payload): Json<SendSolRequest>) -> poem::Result<poem::Res
 
 fn send_sol_instruction(payload: &SendSolRequest) -> anyhow::Result<SolTransferResponse> {
     if payload.lamports == 0 {
-        return Err(anyhow::anyhow!("Invalid amount"));
+        return Err(anyhow::anyhow!("Amount must be greater than 0"));
     }
 
-    let from_pubkey = Pubkey::from_str(&payload.from)?;
-    let to_pubkey = Pubkey::from_str(&payload.to)?;
+    let from_pubkey = Pubkey::from_str(&payload.from)
+        .map_err(|_| anyhow::anyhow!("Invalid sender public key"))?;
+    let to_pubkey = Pubkey::from_str(&payload.to)
+        .map_err(|_| anyhow::anyhow!("Invalid recipient public key"))?;
 
     let instruction = system_instruction::transfer(&from_pubkey, &to_pubkey, payload.lamports);
 
     Ok(SolTransferResponse {
         program_id: instruction.program_id.to_string(),
         accounts: instruction.accounts.iter().map(|acc| acc.pubkey.to_string()).collect(),
-        instruction_data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &instruction.data),
+        instruction_data: bs58::encode(&instruction.data).into_string(),
     })
 }
 
@@ -269,32 +286,49 @@ async fn send_token(Json(payload): Json<SendTokenRequest>) -> poem::Result<poem:
 }
 
 fn send_token_instruction(payload: &SendTokenRequest) -> anyhow::Result<TokenTransferResponse> {
-    let mint_pubkey = Pubkey::from_str(&payload.mint)?;
-    let owner_pubkey = Pubkey::from_str(&payload.owner)?;
-    let destination_pubkey = Pubkey::from_str(&payload.destination)?;
+    let mint = payload.mint.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: mint"))?;
+    let owner = payload.owner.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: owner"))?;
+    let destination = payload.destination.as_ref().ok_or_else(|| anyhow::anyhow!("Missing required field: destination"))?;
+    let amount = payload.amount.ok_or_else(|| anyhow::anyhow!("Missing required field: amount"))?;
+
+    let mint_pubkey = Pubkey::from_str(mint)?;
+    let owner_pubkey = Pubkey::from_str(owner)?;
+    let destination_pubkey = Pubkey::from_str(destination)?;
 
     let source_token_account = spl_associated_token_account::get_associated_token_address(
         &owner_pubkey,
         &mint_pubkey,
     );
 
+    let destination_token_account = spl_associated_token_account::get_associated_token_address(
+        &destination_pubkey,
+        &mint_pubkey,
+    );
+
     let instruction = token_instruction::transfer(
         &spl_token::id(),
         &source_token_account,
-        &destination_pubkey,
+        &destination_token_account,
         &owner_pubkey,
         &[],
-        payload.amount,
+        amount,
     )?;
 
-    let accounts: Vec<TokenTransferAccount> = instruction
-        .accounts
-        .iter()
-        .map(|acc| TokenTransferAccount {
-            pubkey: acc.pubkey.to_string(),
-            is_signer: acc.is_signer,
-        })
-        .collect();
+    
+    let accounts = vec![
+        TokenTransferAccount {
+            pubkey: owner.clone(), 
+            is_signer: false,
+        },
+        TokenTransferAccount {
+            pubkey: destination_token_account.to_string(),
+            is_signer: false,
+        },
+        TokenTransferAccount {
+            pubkey: owner.clone(),  
+            is_signer: false,
+        },
+    ];
 
     Ok(TokenTransferResponse {
         program_id: instruction.program_id.to_string(),
